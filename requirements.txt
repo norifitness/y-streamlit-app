@@ -3,4 +3,4 @@ openai
 llama-index
 chromadb
 tiktoken
-PyPDF2
+pypdf2
