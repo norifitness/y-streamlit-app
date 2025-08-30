@@ -7,7 +7,9 @@ from PIL import Image
 from llama_index.core import StorageContext, load_index_from_storage
 
 # ✅ OpenAI APIキー
-openai.api_key = st.secrets["openai"]["api_key"]
+import os
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
 
 # ✅ Base64画像変換（アバター用）
 def get_base64_image(image_path):
