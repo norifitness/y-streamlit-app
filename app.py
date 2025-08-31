@@ -7,37 +7,14 @@ import re
 import base64
 import mimetypes
 from pathlib import Path
+import streamlit as st
 from PIL import Image
-
-# ---- Streamlit のファイル監視を軽量化/無効化（必ず streamlit import 前）----
-os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "poll")
-# 大きいディレクトリは監視対象から外す（カンマ区切り）
-os.environ.setdefault("STREAMLIT_SERVER_FOLDER_WATCH_BLACKLIST", "data,.git,.venv,node_modules")
-
-import streamlit as st  # ← ここで初めて import
-
-# 念のためコード側からも適用（環境変数が効かない場合の保険）
-try:
-    st.set_option("server.fileWatcherType", "poll")
-    st.set_option("server.folderWatchBlacklist", ["data", ".git", ".venv", "node_modules"])
-except Exception:
-    pass
 
 # ===== OpenAI =====
 from openai import OpenAI
-
-# st.secrets が無い環境でも安全に取り出すラッパー
-def _safe_secret(section: str, key: str, default=None):
-    try:
-        sec = st.secrets  # secrets.toml が無いとここで例外
-        return (sec.get(section, {}) or {}).get(key, default)
-    except Exception:
-        return default
-
-# まずは環境変数を優先。無ければ secrets.toml から（両対応）
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or _safe_secret("openai", "api_key")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("openai", {}).get("api_key")
 if not OPENAI_API_KEY:
-    st.error("❌ OPENAI_API_KEY が設定されていません。Cloud Run では『環境変数』に、Streamlit Cloud では『Secrets』に設定してください。")
+    st.error("❌ OPENAI_API_KEY が設定されていません。`.streamlit/secrets.toml` または環境変数で設定してください。")
     st.stop()
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -82,7 +59,6 @@ def _pick_year_from_text(text: str) -> str | None:
     return None
 
 def extract_year(meta: dict, preview_text: str) -> str | None:
-    # ファイル名やメタ情報、テキストから順に探索
     for k in ("file_name", "document_id", "doc_id", "source", "title"):
         if k in meta and isinstance(meta[k], str):
             y = _pick_year_from_text(meta[k])
@@ -124,7 +100,7 @@ def detect_index_dim(persist_dir: str) -> int | None:
     except Exception:
         return None
 
-# ========= RAG ローダ（retriever一貫・キャッシュ） =========
+# ========= RAG ローダ =========
 INDEX_DIR = "./data"
 
 @st.cache_resource
@@ -134,22 +110,21 @@ def load_rag(_rev: str):
 
     detected_dim = detect_index_dim(INDEX_DIR)
     if detected_dim == 3072:
-        embed_model_name = "text-embedding-3-large"      # 3072
+        embed_model_name = "text-embedding-3-large"
     elif detected_dim == 1536:
-        # 1536次元の index は text-embedding-3-small か ada-002 の可能性
-        # 後方互換優先で ada-002 を利用
-        embed_model_name = "text-embedding-ada-002"
+        embed_model_name = "text-embedding-ada-002"  # 旧互換
     else:
         embed_model_name = "text-embedding-ada-002"
 
     Settings.embed_model = OpenAIEmbedding(model=embed_model_name, api_key=OPENAI_API_KEY)
 
-    # 非同期/監視を使わない静的ロード
+    # ✅ 同期ロードを維持
     storage_context = StorageContext.from_defaults(persist_dir=INDEX_DIR)
-    index = load_index_from_storage(storage_context, use_async=False)
+    index = load_index_from_storage(storage_context)
 
-    retriever = index.as_retriever(similarity_top_k=20)
-    post = SimilarityPostprocessor(similarity_cutoff=0.45)
+    # ✅ recall を強化
+    retriever = index.as_retriever(similarity_top_k=30)
+    post = SimilarityPostprocessor(similarity_cutoff=0.40)  # 少し緩める
     synth = get_response_synthesizer(response_mode="tree_summarize")
 
     try:
@@ -168,8 +143,7 @@ def load_rag(_rev: str):
 # ========= UI 初期化 =========
 st.set_page_config(page_title="のりfitnessAI", layout="centered")
 avatar_base64 = get_base64_image("のりfitnessAI (1).png")
-# use_container_width の非推奨を回避
-st.image("のりfitnessAI.png", width="stretch")
+st.image("のりfitnessAI.png", use_container_width=True)
 st.title("のりフィットネスAI")
 st.markdown("📸 **食事や筋トレフォームの画像があればアップしてね！**")
 
@@ -184,11 +158,11 @@ except Exception as e:
     st.error(f"❌ RAGの初期化に失敗しました: {e}")
     st.stop()
 
-# ========= 開発モード判定（サイドバーの表示切替） =========
-env_from_secrets = _safe_secret("app", "env")
+# ========= 開発モード判定 =========
+env_from_secrets = (st.secrets.get("app", {}) or {}).get("env")
 debug_qp = None
 try:
-    debug_qp = st.query_params.get("debug")  # ?debug=1 で強制表示
+    debug_qp = st.query_params.get("debug")
 except Exception:
     pass
 
@@ -196,10 +170,9 @@ DEV_MODE = (
     (os.getenv("APP_ENV") or env_from_secrets or "production") != "production"
 ) or (str(debug_qp).lower() in ("1", "true"))
 
-# サイドバー非表示時にも参照される既定値
 strict = False
 
-# ========= サイドバー：デバッグ/診断（開発時のみ表示） =========
+# ========= サイドバー =========
 if DEV_MODE:
     with st.sidebar:
         st.header("🔧 Debug / RAG Health")
@@ -215,14 +188,14 @@ if DEV_MODE:
 
         st.subheader("🔎 診断クエリ")
         diag_q = st.text_input("例: タンパク質 高齢 1.5倍", value="人工甘味料 体重")
-        tmp_cutoff = st.slider("similarity_cutoff（診断用）", 0.0, 0.9, 0.45, 0.05)
+        tmp_cutoff = st.slider("similarity_cutoff（診断用）", 0.0, 0.9, 0.40, 0.05)
         if st.button("実行"):
             try:
                 raw_hits = retriever.retrieve(diag_q)
-                st.write("raw_hits (cutoff前):", len(raw_hits))
+                st.write("raw_hits:", len(raw_hits))
                 diag_post = SimilarityPostprocessor(similarity_cutoff=tmp_cutoff)
                 filtered = diag_post.postprocess_nodes(raw_hits)
-                st.write(f"filtered_hits (cutoff後, {tmp_cutoff}):", len(filtered))
+                st.write("filtered_hits:", len(filtered))
                 st.code(fmt_sources(filtered if filtered else raw_hits, max_items=5), language="text")
             except Exception as e:
                 st.write("診断エラー:", e)
@@ -236,7 +209,7 @@ uploaded_images = st.file_uploader("画像をアップロード（複数可）",
 image_data_urls = []
 if uploaded_images:
     for img in uploaded_images:
-        st.image(img, width="stretch")
+        st.image(img, use_container_width=True)
         image_data_urls.append(image_to_base64_str(img))
 
 # ========= チャット入力 =========
@@ -250,23 +223,21 @@ if user_input:
             raw_nodes = retriever.retrieve(user_input)
             nodes = postproc.postprocess_nodes(raw_nodes)
 
-            # --- 年ヒントを収集 ---
             years = []
-            for n in nodes[:5]:  # 上位から最大5件
+            for n in nodes[:5]:
                 meta = n.node.metadata or {}
                 preview = (n.node.get_content() or "")
                 y = extract_year(meta, preview)
                 if y: years.append(y)
-            years_uniq = sorted(set(years), reverse=True)  # 新しい順
+            years_uniq = sorted(set(years), reverse=True)
 
             if nodes:
                 rag_result = synthesizer.synthesize(query=user_input, nodes=nodes)
                 rag_text = getattr(rag_result, "response", None) or str(rag_result) or ""
                 sources_block = fmt_sources(nodes, max_items=3, with_preview=True)
-
                 if years_uniq:
-                    rag_text += "\n\n**年ヒント（本文で使って！）:** " + ", ".join([f"{y}年" for y in years_uniq])
-                rag_text += "\n\n---\n**参照元（上位）**\n" + sources_block
+                    rag_text += "\n\n**年ヒント:** " + ", ".join([f"{y}年" for y in years_uniq])
+                rag_text += "\n\n---\n**参照元**\n" + sources_block
             else:
                 rag_text = "（関連する根拠ドキュメントが見つかりませんでした）"
 
@@ -274,27 +245,24 @@ if user_input:
             rag_text = f"❌ 論文ベースの回答取得でエラー：{e}"
             nodes = []
 
-        # --- 年表現を強制する system プロンプト ---
         system_prompt = (
             "あなたは『のりfitness』という理論派トレーナーです。"
-            "以下の『コンテキスト』に**厳密に基づいて**回答してください。"
-            "少なくとも一度は『YYYY年の研究では〜』という表現で“年”を明示し、"
-            "可能なら複数年（例: 2025年・2023年）を自然な日本語で織り込みます。"
-            "根拠が無い場合は『根拠なし』と明示し、推測で断定しないこと。"
-            "専門用語は避け、使う場合は短い説明を添えること。"
-            "画像があればフォームや食事の具体的改善案も提示。"
+            "以下の『コンテキスト』に基づいて回答してください。"
+            "必ず少なくとも一度は『YYYY年の研究では〜』という形で年を明示し、"
+            "複数年（例: 2025年・2023年）があれば自然に盛り込むこと。"
+            "根拠が無い場合は『ここからは根拠なしですが』と明示し、推測で断定しないこと。"
             "トーンは明るく、頼れる兄貴のように。"
         )
 
         if strict and not nodes:
-            assistant_reply = "根拠ドキュメントが見つからなかったため、この質問には回答しません（RAG厳格モード）。質問の言い換えや論文追加をお願いします。"
+            assistant_reply = "根拠ドキュメントが無いため回答を控えます（RAG厳格モード）。"
         else:
             latest_user_content = [
                 {"type": "text",
                  "text": (
                      f"質問: {user_input}\n\n---\n"
-                     f"コンテキスト（RAG要約＋参照元＋年ヒント）:\n{rag_text}\n"
-                     f"---\nこのコンテキストの範囲で、わかりやすく回答してください。"
+                     f"コンテキスト:\n{rag_text}\n"
+                     f"---\nこの範囲で回答してください。"
                  )}]
             for url in image_data_urls:
                 latest_user_content.append({"type": "image_url", "image_url": {"url": url}})
@@ -310,7 +278,7 @@ if user_input:
                 )
                 assistant_reply = resp.choices[0].message.content
             except Exception as e:
-                assistant_reply = f"⚠️ ChatGPT応答でエラーが発生しました: {e}"
+                assistant_reply = f"⚠️ ChatGPT応答でエラー: {e}"
 
         st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
 
