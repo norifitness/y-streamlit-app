@@ -25,9 +25,19 @@ except Exception:
 
 # ===== OpenAI =====
 from openai import OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("openai", {}).get("api_key")
+
+# st.secrets が無い環境でも安全に取り出すラッパー
+def _safe_secret(section: str, key: str, default=None):
+    try:
+        sec = st.secrets  # secrets.toml が無いとここで例外
+        return (sec.get(section, {}) or {}).get(key, default)
+    except Exception:
+        return default
+
+# まずは環境変数を優先。無ければ secrets.toml から（両対応）
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or _safe_secret("openai", "api_key")
 if not OPENAI_API_KEY:
-    st.error("❌ OPENAI_API_KEY が設定されていません。`.streamlit/secrets.toml` または環境変数で設定してください。")
+    st.error("❌ OPENAI_API_KEY が設定されていません。Cloud Run では『環境変数』に、Streamlit Cloud では『Secrets』に設定してください。")
     st.stop()
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -127,14 +137,14 @@ def load_rag(_rev: str):
         embed_model_name = "text-embedding-3-large"      # 3072
     elif detected_dim == 1536:
         # 1536次元の index は text-embedding-3-small か ada-002 の可能性
-        # どちらでも検索品質は実運用上大差ないため後方互換優先で ada-002 を利用
+        # 後方互換優先で ada-002 を利用
         embed_model_name = "text-embedding-ada-002"
     else:
         embed_model_name = "text-embedding-ada-002"
 
     Settings.embed_model = OpenAIEmbedding(model=embed_model_name, api_key=OPENAI_API_KEY)
 
-    # 👇 非同期/監視を使わない静的ロードにする
+    # 非同期/監視を使わない静的ロード
     storage_context = StorageContext.from_defaults(persist_dir=INDEX_DIR)
     index = load_index_from_storage(storage_context, use_async=False)
 
@@ -158,7 +168,8 @@ def load_rag(_rev: str):
 # ========= UI 初期化 =========
 st.set_page_config(page_title="のりfitnessAI", layout="centered")
 avatar_base64 = get_base64_image("のりfitnessAI (1).png")
-st.image("のりfitnessAI.png", use_container_width=True)
+# use_container_width の非推奨を回避
+st.image("のりfitnessAI.png", width="stretch")
 st.title("のりフィットネスAI")
 st.markdown("📸 **食事や筋トレフォームの画像があればアップしてね！**")
 
@@ -174,7 +185,7 @@ except Exception as e:
     st.stop()
 
 # ========= 開発モード判定（サイドバーの表示切替） =========
-env_from_secrets = (st.secrets.get("app", {}) or {}).get("env")
+env_from_secrets = _safe_secret("app", "env")
 debug_qp = None
 try:
     debug_qp = st.query_params.get("debug")  # ?debug=1 で強制表示
@@ -225,7 +236,7 @@ uploaded_images = st.file_uploader("画像をアップロード（複数可）",
 image_data_urls = []
 if uploaded_images:
     for img in uploaded_images:
-        st.image(img, use_container_width=True)
+        st.image(img, width="stretch")
         image_data_urls.append(image_to_base64_str(img))
 
 # ========= チャット入力 =========
