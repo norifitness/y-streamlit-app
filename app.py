@@ -1,5 +1,6 @@
 # =========================
 # のりfitnessAI（RAG一貫化 + 会話メモリ + 引用可視化 + 診断UI + 年明示）
+# Cloud Run対応: secrets未設定でも落ちないように改善
 # =========================
 import os
 import json
@@ -24,10 +25,24 @@ except Exception:
 
 # ===== OpenAI =====
 from openai import OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("openai", {}).get("api_key")
+
+def _safe_secrets() -> dict:
+    """secrets.toml が無い環境（Cloud Runなど）でも落ちない安全ラッパー"""
+    try:
+        return dict(st.secrets)
+    except Exception:
+        return {}
+
+SECRETS = _safe_secrets()
+
+OPENAI_API_KEY = (
+    os.getenv("OPENAI_API_KEY") or
+    (SECRETS.get("openai", {}) or {}).get("api_key")
+)
 if not OPENAI_API_KEY:
-    st.error("❌ OPENAI_API_KEY が設定されていません。`.streamlit/secrets.toml` または環境変数で設定してください。")
+    st.error("❌ OPENAI_API_KEY が設定されていません。環境変数または .streamlit/secrets.toml を設定してください。")
     st.stop()
+
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -36,7 +51,6 @@ from llama_index.core import StorageContext, load_index_from_storage, Settings
 from llama_index.core.postprocessor import SimilarityPostprocessor
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.response_synthesizers import get_response_synthesizer
-
 
 # ========= ユーティリティ =========
 def get_base64_image(image_path: str) -> str:
@@ -60,7 +74,6 @@ def build_openai_messages(history, latest_user_content):
         msgs.append({"role": role, "content": content})
     msgs.append({"role": "user", "content": latest_user_content})
     return msgs
-
 
 # ---- 年を抽出するヘルパー ----
 YEAR_RE = re.compile(r"(20\d{2})年?|(?:\()?(20\d{2})(?:\))?")
@@ -97,7 +110,6 @@ def fmt_sources(nodes, max_items=3, with_preview=True):
             lines.append(f"- [{year}] score={score_txt} {file_or_id}{page_txt}")
     return "\n".join(lines)
 
-
 # ---- index 情報の検出 ----
 INDEX_DIR = "./data"
 
@@ -118,20 +130,18 @@ def data_signature(persist_dir: str) -> str:
 def detect_index_model(persist_dir: str) -> tuple[str|None, int|None]:
     """vector_store から埋め込みモデル名と次元を推定"""
     vf = Path(persist_dir) / "default__vector_store.json"
-    if not vf.exists(): 
+    if not vf.exists():
         return None, None
     try:
         with open(vf, "r", encoding="utf-8") as f:
             data = json.load(f)
         meta = data.get("metadata") or {}
-        # ありがちなキーたち
         model = (
             meta.get("model_name") or
             meta.get("embed_model") or
             meta.get("embedding_model") or
             meta.get("embedding_model_name")
         )
-        # 次元
         dim = meta.get("embedding_dim")
         if not dim:
             emb_dict = data.get("embedding_dict") or data.get("embeddings") or {}
@@ -142,7 +152,6 @@ def detect_index_model(persist_dir: str) -> tuple[str|None, int|None]:
         return (str(model) if model else None), (int(dim) if dim else None)
     except Exception:
         return None, None
-
 
 # ========= RAG ローダ（retriever一貫・キャッシュ） =========
 @st.cache_resource(show_spinner=False)
@@ -159,10 +168,9 @@ def load_rag(_rev: str, _sig: str):
         if detected_dim == 3072:
             embed_model_name = "text-embedding-3-large"
         elif detected_dim == 1536:
-            embed_model_name = "text-embedding-3-small"   # ← 1536は3-smallを既定に
+            embed_model_name = "text-embedding-3-small"   # 1536は3-smallを既定に
         else:
-            # 不明：安全側で3-small（1536）
-            embed_model_name = "text-embedding-3-small"
+            embed_model_name = "text-embedding-3-small"   # 不明：安全側
 
     Settings.embed_model = OpenAIEmbedding(model=embed_model_name, api_key=OPENAI_API_KEY)
 
@@ -188,7 +196,6 @@ def load_rag(_rev: str, _sig: str):
     }
     return retriever, post, synth, health
 
-
 # ========= UI 初期化 =========
 st.set_page_config(page_title="のりfitnessAI", layout="centered")
 avatar_base64 = get_base64_image("のりfitnessAI (1).png")
@@ -210,7 +217,7 @@ except Exception as e:
     st.stop()
 
 # ========= 開発モード判定（サイドバーの表示切替） =========
-env_from_secrets = (st.secrets.get("app", {}) or {}).get("env")
+env_from_secrets = (SECRETS.get("app", {}) or {}).get("env")  # ← safe
 debug_qp = None
 try:
     debug_qp = st.query_params.get("debug")  # ?debug=1 で強制表示
