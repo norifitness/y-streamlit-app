@@ -6,9 +6,21 @@ import json
 import re
 import base64
 import mimetypes
+import hashlib
 from pathlib import Path
-import streamlit as st
 from PIL import Image
+
+# ---- Streamlit のファイル監視を軽量化/無効化（必ず streamlit import 前）----
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "poll")
+os.environ.setdefault("STREAMLIT_SERVER_FOLDER_WATCH_BLACKLIST", "data,.git,.venv,node_modules")
+
+import streamlit as st  # ← ここで初めて import
+
+try:
+    st.set_option("server.fileWatcherType", "poll")
+    st.set_option("server.folderWatchBlacklist", ["data", ".git", ".venv", "node_modules"])
+except Exception:
+    pass
 
 # ===== OpenAI =====
 from openai import OpenAI
@@ -24,6 +36,7 @@ from llama_index.core import StorageContext, load_index_from_storage, Settings
 from llama_index.core.postprocessor import SimilarityPostprocessor
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.response_synthesizers import get_response_synthesizer
+
 
 # ========= ユーティリティ =========
 def get_base64_image(image_path: str) -> str:
@@ -47,6 +60,7 @@ def build_openai_messages(history, latest_user_content):
         msgs.append({"role": role, "content": content})
     msgs.append({"role": "user", "content": latest_user_content})
     return msgs
+
 
 # ---- 年を抽出するヘルパー ----
 YEAR_RE = re.compile(r"(20\d{2})年?|(?:\()?(20\d{2})(?:\))?")
@@ -83,48 +97,81 @@ def fmt_sources(nodes, max_items=3, with_preview=True):
             lines.append(f"- [{year}] score={score_txt} {file_or_id}{page_txt}")
     return "\n".join(lines)
 
-# ---- 埋め込み次元を自動判定 ----
-def detect_index_dim(persist_dir: str) -> int | None:
+
+# ---- index 情報の検出 ----
+INDEX_DIR = "./data"
+
+def data_signature(persist_dir: str) -> str:
+    """data/ 配下の主要3ファイルの SHA256 をまとめた署名（キャッシュバスター）"""
+    parts = []
+    for name in ("default__vector_store.json", "docstore.json", "index_store.json"):
+        p = Path(persist_dir) / name
+        if not p.exists():
+            continue
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        parts.append(f"{name}:{h.hexdigest()}")
+    return "|".join(parts)
+
+def detect_index_model(persist_dir: str) -> tuple[str|None, int|None]:
+    """vector_store から埋め込みモデル名と次元を推定"""
     vf = Path(persist_dir) / "default__vector_store.json"
-    if not vf.exists(): return None
+    if not vf.exists(): 
+        return None, None
     try:
         with open(vf, "r", encoding="utf-8") as f:
             data = json.load(f)
-        emb_dict = data.get("embedding_dict") or data.get("embeddings") or {}
-        if isinstance(emb_dict, dict) and emb_dict:
-            first_vec = next(iter(emb_dict.values()))
-            if isinstance(first_vec, list):
-                return len(first_vec)
-        dim = (data.get("metadata") or {}).get("embedding_dim")
-        return int(dim) if isinstance(dim, int) else None
+        meta = data.get("metadata") or {}
+        # ありがちなキーたち
+        model = (
+            meta.get("model_name") or
+            meta.get("embed_model") or
+            meta.get("embedding_model") or
+            meta.get("embedding_model_name")
+        )
+        # 次元
+        dim = meta.get("embedding_dim")
+        if not dim:
+            emb_dict = data.get("embedding_dict") or data.get("embeddings") or {}
+            if isinstance(emb_dict, dict) and emb_dict:
+                first = next(iter(emb_dict.values()))
+                if isinstance(first, list):
+                    dim = len(first)
+        return (str(model) if model else None), (int(dim) if dim else None)
     except Exception:
-        return None
+        return None, None
 
-# ========= RAG ローダ =========
-INDEX_DIR = "./data"
 
-@st.cache_resource
-def load_rag(_rev: str):
+# ========= RAG ローダ（retriever一貫・キャッシュ） =========
+@st.cache_resource(show_spinner=False)
+def load_rag(_rev: str, _sig: str):
     if not os.path.exists(INDEX_DIR) or not os.listdir(INDEX_DIR):
         raise FileNotFoundError(f"❌ index が見つかりません: {os.path.abspath(INDEX_DIR)}")
 
-    detected_dim = detect_index_dim(INDEX_DIR)
-    if detected_dim == 3072:
-        embed_model_name = "text-embedding-3-large"
-    elif detected_dim == 1536:
-        embed_model_name = "text-embedding-ada-002"  # 旧互換
+    model_name_hint, detected_dim = detect_index_model(INDEX_DIR)
+
+    # モデル決定ロジック：indexに書いてある名前を最優先 → 次元で推定
+    if model_name_hint:
+        embed_model_name = model_name_hint
     else:
-        embed_model_name = "text-embedding-ada-002"
+        if detected_dim == 3072:
+            embed_model_name = "text-embedding-3-large"
+        elif detected_dim == 1536:
+            embed_model_name = "text-embedding-3-small"   # ← 1536は3-smallを既定に
+        else:
+            # 不明：安全側で3-small（1536）
+            embed_model_name = "text-embedding-3-small"
 
     Settings.embed_model = OpenAIEmbedding(model=embed_model_name, api_key=OPENAI_API_KEY)
 
-    # ✅ 同期ロードを維持
+    # 静的ロード（watch/asyncなし）
     storage_context = StorageContext.from_defaults(persist_dir=INDEX_DIR)
-    index = load_index_from_storage(storage_context)
+    index = load_index_from_storage(storage_context, use_async=False)
 
-    # ✅ recall を強化
-    retriever = index.as_retriever(similarity_top_k=30)
-    post = SimilarityPostprocessor(similarity_cutoff=0.40)  # 少し緩める
+    retriever = index.as_retriever(similarity_top_k=20)
+    post = SimilarityPostprocessor(similarity_cutoff=0.45)
     synth = get_response_synthesizer(response_mode="tree_summarize")
 
     try:
@@ -137,13 +184,16 @@ def load_rag(_rev: str):
         "node_count": node_count,
         "detected_dim": detected_dim,
         "embed_model": embed_model_name,
+        "data_signature": _sig[:20] + "…" if _sig else "",
     }
     return retriever, post, synth, health
+
 
 # ========= UI 初期化 =========
 st.set_page_config(page_title="のりfitnessAI", layout="centered")
 avatar_base64 = get_base64_image("のりfitnessAI (1).png")
-st.image("のりfitnessAI.png", use_container_width=True)
+# Streamlitの新仕様: use_container_width → width='stretch'
+st.image("のりfitnessAI.png", width="stretch")
 st.title("のりフィットネスAI")
 st.markdown("📸 **食事や筋トレフォームの画像があればアップしてね！**")
 
@@ -153,16 +203,17 @@ if "messages" not in st.session_state:
 
 # ========= RAG 読み込み =========
 try:
-    retriever, postproc, synthesizer, rag_health = load_rag(os.getenv("K_REVISION", "local"))
+    sig = data_signature(INDEX_DIR)
+    retriever, postproc, synthesizer, rag_health = load_rag(os.getenv("K_REVISION", "local"), sig)
 except Exception as e:
     st.error(f"❌ RAGの初期化に失敗しました: {e}")
     st.stop()
 
-# ========= 開発モード判定 =========
+# ========= 開発モード判定（サイドバーの表示切替） =========
 env_from_secrets = (st.secrets.get("app", {}) or {}).get("env")
 debug_qp = None
 try:
-    debug_qp = st.query_params.get("debug")
+    debug_qp = st.query_params.get("debug")  # ?debug=1 で強制表示
 except Exception:
     pass
 
@@ -172,7 +223,7 @@ DEV_MODE = (
 
 strict = False
 
-# ========= サイドバー =========
+# ========= サイドバー：デバッグ/診断（開発時のみ表示） =========
 if DEV_MODE:
     with st.sidebar:
         st.header("🔧 Debug / RAG Health")
@@ -181,6 +232,7 @@ if DEV_MODE:
         st.write("node_count:", rag_health.get("node_count"))
         st.write("detected_dim:", rag_health.get("detected_dim"))
         st.write("embed_model:", rag_health.get("embed_model"))
+        st.write("data_signature:", rag_health.get("data_signature"))
         masked = OPENAI_API_KEY[:4] + "…" + OPENAI_API_KEY[-4:]
         st.write("OPENAI_API_KEY:", masked)
 
@@ -188,14 +240,14 @@ if DEV_MODE:
 
         st.subheader("🔎 診断クエリ")
         diag_q = st.text_input("例: タンパク質 高齢 1.5倍", value="人工甘味料 体重")
-        tmp_cutoff = st.slider("similarity_cutoff（診断用）", 0.0, 0.9, 0.40, 0.05)
+        tmp_cutoff = st.slider("similarity_cutoff（診断用）", 0.0, 0.9, 0.45, 0.05)
         if st.button("実行"):
             try:
                 raw_hits = retriever.retrieve(diag_q)
-                st.write("raw_hits:", len(raw_hits))
+                st.write("raw_hits (cutoff前):", len(raw_hits))
                 diag_post = SimilarityPostprocessor(similarity_cutoff=tmp_cutoff)
                 filtered = diag_post.postprocess_nodes(raw_hits)
-                st.write("filtered_hits:", len(filtered))
+                st.write(f"filtered_hits (cutoff後, {tmp_cutoff}):", len(filtered))
                 st.code(fmt_sources(filtered if filtered else raw_hits, max_items=5), language="text")
             except Exception as e:
                 st.write("診断エラー:", e)
@@ -209,7 +261,7 @@ uploaded_images = st.file_uploader("画像をアップロード（複数可）",
 image_data_urls = []
 if uploaded_images:
     for img in uploaded_images:
-        st.image(img, use_container_width=True)
+        st.image(img, width="stretch")
         image_data_urls.append(image_to_base64_str(img))
 
 # ========= チャット入力 =========
@@ -223,6 +275,7 @@ if user_input:
             raw_nodes = retriever.retrieve(user_input)
             nodes = postproc.postprocess_nodes(raw_nodes)
 
+            # --- 年ヒントを収集 ---
             years = []
             for n in nodes[:5]:
                 meta = n.node.metadata or {}
@@ -235,9 +288,10 @@ if user_input:
                 rag_result = synthesizer.synthesize(query=user_input, nodes=nodes)
                 rag_text = getattr(rag_result, "response", None) or str(rag_result) or ""
                 sources_block = fmt_sources(nodes, max_items=3, with_preview=True)
+
                 if years_uniq:
-                    rag_text += "\n\n**年ヒント:** " + ", ".join([f"{y}年" for y in years_uniq])
-                rag_text += "\n\n---\n**参照元**\n" + sources_block
+                    rag_text += "\n\n**年ヒント（本文で使って！）:** " + ", ".join([f"{y}年" for y in years_uniq])
+                rag_text += "\n\n---\n**参照元（上位）**\n" + sources_block
             else:
                 rag_text = "（関連する根拠ドキュメントが見つかりませんでした）"
 
@@ -247,22 +301,24 @@ if user_input:
 
         system_prompt = (
             "あなたは『のりfitness』という理論派トレーナーです。"
-            "以下の『コンテキスト』に基づいて回答してください。"
-            "必ず少なくとも一度は『YYYY年の研究では〜』という形で年を明示し、"
-            "複数年（例: 2025年・2023年）があれば自然に盛り込むこと。"
-            "根拠が無い場合は『ここからは根拠なしですが』と明示し、推測で断定しないこと。"
+            "以下の『コンテキスト』に**厳密に基づいて**回答してください。"
+            "少なくとも一度は『YYYY年の研究では〜』という表現で“年”を明示し、"
+            "可能なら複数年（例: 2025年・2023年）を自然な日本語で織り込みます。"
+            "根拠が無い場合は『根拠なし』と明示し、推測で断定しないこと。"
+            "専門用語は避け、使う場合は短い説明を添えること。"
+            "画像があればフォームや食事の具体的改善案も提示。"
             "トーンは明るく、頼れる兄貴のように。"
         )
 
         if strict and not nodes:
-            assistant_reply = "根拠ドキュメントが無いため回答を控えます（RAG厳格モード）。"
+            assistant_reply = "根拠ドキュメントが見つからなかったため、この質問には回答しません（RAG厳格モード）。質問の言い換えや論文追加をお願いします。"
         else:
             latest_user_content = [
                 {"type": "text",
                  "text": (
                      f"質問: {user_input}\n\n---\n"
-                     f"コンテキスト:\n{rag_text}\n"
-                     f"---\nこの範囲で回答してください。"
+                     f"コンテキスト（RAG要約＋参照元＋年ヒント）:\n{rag_text}\n"
+                     f"---\nこのコンテキストの範囲で、わかりやすく回答してください。"
                  )}]
             for url in image_data_urls:
                 latest_user_content.append({"type": "image_url", "image_url": {"url": url}})
@@ -278,7 +334,7 @@ if user_input:
                 )
                 assistant_reply = resp.choices[0].message.content
             except Exception as e:
-                assistant_reply = f"⚠️ ChatGPT応答でエラー: {e}"
+                assistant_reply = f"⚠️ ChatGPT応答でエラーが発生しました: {e}"
 
         st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
 
