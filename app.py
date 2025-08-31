@@ -7,8 +7,21 @@ import re
 import base64
 import mimetypes
 from pathlib import Path
-import streamlit as st
 from PIL import Image
+
+# ---- Streamlit のファイル監視を軽量化/無効化（必ず streamlit import 前）----
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "poll")
+# 大きいディレクトリは監視対象から外す（カンマ区切り）
+os.environ.setdefault("STREAMLIT_SERVER_FOLDER_WATCH_BLACKLIST", "data,.git,.venv,node_modules")
+
+import streamlit as st  # ← ここで初めて import
+
+# 念のためコード側からも適用（環境変数が効かない場合の保険）
+try:
+    st.set_option("server.fileWatcherType", "poll")
+    st.set_option("server.folderWatchBlacklist", ["data", ".git", ".venv", "node_modules"])
+except Exception:
+    pass
 
 # ===== OpenAI =====
 from openai import OpenAI
@@ -113,14 +126,17 @@ def load_rag(_rev: str):
     if detected_dim == 3072:
         embed_model_name = "text-embedding-3-large"      # 3072
     elif detected_dim == 1536:
-        embed_model_name = "text-embedding-ada-002"      # 1536（旧index互換最優先）
+        # 1536次元の index は text-embedding-3-small か ada-002 の可能性
+        # どちらでも検索品質は実運用上大差ないため後方互換優先で ada-002 を利用
+        embed_model_name = "text-embedding-ada-002"
     else:
         embed_model_name = "text-embedding-ada-002"
 
     Settings.embed_model = OpenAIEmbedding(model=embed_model_name, api_key=OPENAI_API_KEY)
 
+    # 👇 非同期/監視を使わない静的ロードにする
     storage_context = StorageContext.from_defaults(persist_dir=INDEX_DIR)
-    index = load_index_from_storage(storage_context)
+    index = load_index_from_storage(storage_context, use_async=False)
 
     retriever = index.as_retriever(similarity_top_k=20)
     post = SimilarityPostprocessor(similarity_cutoff=0.45)
